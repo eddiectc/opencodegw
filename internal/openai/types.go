@@ -18,7 +18,43 @@ type JSONSchemaRef struct {
 
 type Tool struct {
 	Type     string       `json:"type"` // function
-	Function ToolFunction `json:"function"`
+	Function ToolFunction `json:"function,omitempty"`
+}
+
+// UnmarshalJSON accepts both the chat shape
+// ({"type":"function","function":{...}}) and the flat Responses shape
+// ({"type":"function","name":...,"parameters":...}).
+func (t *Tool) UnmarshalJSON(data []byte) error {
+	type alias Tool
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	if a.Function.Name == "" {
+		var flat struct {
+			Name        string         `json:"name"`
+			Description string         `json:"description"`
+			Parameters  map[string]any `json:"parameters"`
+			Strict      *bool          `json:"strict"`
+		}
+		if err := json.Unmarshal(data, &flat); err == nil && flat.Name != "" {
+			a.Function = ToolFunction{
+				Name:        flat.Name,
+				Description: flat.Description,
+				Parameters:  flat.Parameters,
+				Strict:      flat.Strict,
+			}
+		}
+	}
+	*t = Tool(a)
+	return nil
+}
+
+// MarshalJSON emits the chat shape; the Responses translators flatten
+// tools explicitly when building upstream bodies.
+func (t Tool) MarshalJSON() ([]byte, error) {
+	type alias Tool
+	return json.Marshal(alias(t))
 }
 
 type ToolFunction struct {

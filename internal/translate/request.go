@@ -39,13 +39,20 @@ func ChatToResponses(req openai.ChatRequest, model string) map[string]any {
 	if len(req.Tools) > 0 {
 		tools := make([]any, 0, len(req.Tools))
 		for _, t := range req.Tools {
-			tools = append(tools, map[string]any{
-				"type":        "function",
-				"name":        t.Function.Name,
-				"description": t.Function.Description,
-				"parameters":  t.Function.Parameters,
-				"strict":      t.Function.Strict,
-			})
+			tm := map[string]any{
+				"type": "function",
+				"name": t.Function.Name,
+			}
+			if t.Function.Description != "" {
+				tm["description"] = t.Function.Description
+			}
+			if t.Function.Parameters != nil {
+				tm["parameters"] = t.Function.Parameters
+			}
+			if t.Function.Strict != nil {
+				tm["strict"] = *t.Function.Strict
+			}
+			tools = append(tools, tm)
 		}
 		out["tools"] = tools
 	}
@@ -69,6 +76,12 @@ func ChatToResponses(req openai.ChatRequest, model string) map[string]any {
 
 // chatMessagesToResponsesInput converts chat messages to Responses input items.
 // System/developer messages collapse into `instructions`; the rest become input items.
+//
+// Responses content types are role-sensitive: `user`/`system`/`developer`
+// messages use `input_text`/`input_image` parts, while `assistant` history
+// must use `output_text` (upstream rejects `input_text` on assistant
+// messages with 400). Assistant text is emitted before its function calls
+// so history reads in generation order.
 func chatMessagesToResponsesInput(msgs []openai.ChatMessage) (any, string) {
 	var instructions []string
 	var items []any
@@ -79,13 +92,24 @@ func chatMessagesToResponsesInput(msgs []openai.ChatMessage) (any, string) {
 				instructions = append(instructions, s)
 			}
 		case "user":
+			content := toResponsesContent(m.Content)
+			if len(content) == 0 {
+				continue
+			}
 			items = append(items, map[string]any{
 				"type":    "message",
 				"role":    "user",
-				"content": toResponsesContent(m.Content),
+				"content": content,
 			})
 		case "assistant":
 			if len(m.ToolCalls) > 0 {
+				if s := messageText(m.Content); s != "" {
+					items = append(items, map[string]any{
+						"type":    "message",
+						"role":    "assistant",
+						"content": []any{map[string]any{"type": "output_text", "text": s}},
+					})
+				}
 				for _, tc := range m.ToolCalls {
 					items = append(items, map[string]any{
 						"type":      "function_call",
@@ -94,18 +118,15 @@ func chatMessagesToResponsesInput(msgs []openai.ChatMessage) (any, string) {
 						"arguments": tc.Function.Arguments,
 					})
 				}
-				if s := messageText(m.Content); s != "" {
-					items = append(items, map[string]any{
-						"type":    "message",
-						"role":    "assistant",
-						"content": []any{map[string]any{"type": "output_text", "text": s}},
-					})
-				}
 			} else {
+				content := toResponsesAssistantContent(m.Content)
+				if len(content) == 0 {
+					continue
+				}
 				items = append(items, map[string]any{
 					"type":    "message",
 					"role":    "assistant",
-					"content": toResponsesContent(m.Content),
+					"content": content,
 				})
 			}
 		case "tool":
@@ -119,14 +140,80 @@ func chatMessagesToResponsesInput(msgs []openai.ChatMessage) (any, string) {
 	return items, strings.Join(instructions, "\n")
 }
 
+// toResponsesAssistantContent converts chat content to Responses assistant
+// history parts. Assistant messages must use `output_text`, never
+// `input_text`. Non-text parts (images) have no assistant equivalent and
+// are dropped; empty text is skipped so we never emit empty parts.
+func toResponsesAssistantContent(c any) []any {
+	switch v := c.(type) {
+	case nil:
+		return nil
+	case string:
+		if v == "" {
+			return nil
+		}
+		return []any{map[string]any{"type": "output_text", "text": v}}
+	case []any:
+		out := make([]any, 0, len(v))
+		for _, p := range v {
+			m, ok := p.(map[string]any)
+			if !ok {
+				continue
+			}
+			if m["type"] == "text" {
+				if t, ok := m["text"].(string); ok && t != "" {
+					out = append(out, map[string]any{"type": "output_text", "text": t})
+				}
+			}
+		}
+		if len(out) == 0 {
+			// Fall back to flattened text so refusal/reasoning parts
+			// carried as chat content are not silently dropped.
+			if s := messageText(c); s != "" {
+				return []any{map[string]any{"type": "output_text", "text": s}}
+			}
+			return nil
+		}
+		return out
+	default:
+		b, _ := json.Marshal(c)
+		var parts []openai.ContentPart
+		if err := json.Unmarshal(b, &parts); err == nil {
+			out := make([]any, 0, len(parts))
+			for _, p := range parts {
+				if p.Type == "text" && p.Text != "" {
+					out = append(out, map[string]any{"type": "output_text", "text": p.Text})
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		}
+		if s := messageText(c); s != "" {
+			return []any{map[string]any{"type": "output_text", "text": s}}
+		}
+		if s, ok := c.(string); ok && s != "" {
+			return []any{map[string]any{"type": "output_text", "text": s}}
+		}
+		return nil
+	}
+}
+
 func toResponsesContent(c any) []any {
 	switch v := c.(type) {
+	case nil:
+		return nil
 	case string:
+		if v == "" {
+			return nil
+		}
 		return []any{map[string]any{"type": "input_text", "text": v}}
 	case []any:
 		out := make([]any, 0, len(v))
 		for _, p := range v {
-			out = append(out, chatPartToResponsesPart(p))
+			if part, ok := chatPartToResponsesPart(p); ok {
+				out = append(out, part)
+			}
 		}
 		return out
 	default:
@@ -136,27 +223,38 @@ func toResponsesContent(c any) []any {
 		if err := json.Unmarshal(b, &parts); err == nil {
 			out := make([]any, 0, len(parts))
 			for _, p := range parts {
-				out = append(out, chatPartToResponsesPart(map[string]any{
+				if part, ok := chatPartToResponsesPart(map[string]any{
 					"type":      p.Type,
 					"text":      p.Text,
 					"image_url": p.ImageURL,
-				}))
+				}); ok {
+					out = append(out, part)
+				}
 			}
 			return out
 		}
-		return []any{map[string]any{"type": "input_text", "text": fmt.Sprintf("%v", c)}}
+		if s, ok := c.(string); ok && s != "" {
+			return []any{map[string]any{"type": "input_text", "text": s}}
+		}
+		return nil
 	}
 }
 
-func chatPartToResponsesPart(p any) any {
+// chatPartToResponsesPart converts one chat content part to a Responses
+// input part, reporting false for parts that must be dropped (empty text,
+// unknown types, images without a URL).
+func chatPartToResponsesPart(p any) (any, bool) {
 	m, ok := p.(map[string]any)
 	if !ok {
-		return map[string]any{"type": "input_text", "text": fmt.Sprintf("%v", p)}
+		return nil, false
 	}
 	switch m["type"] {
 	case "text":
 		text, _ := m["text"].(string)
-		return map[string]any{"type": "input_text", "text": text}
+		if text == "" {
+			return nil, false
+		}
+		return map[string]any{"type": "input_text", "text": text}, true
 	case "image_url":
 		var url, detail string
 		switch iu := m["image_url"].(type) {
@@ -164,10 +262,16 @@ func chatPartToResponsesPart(p any) any {
 			url, _ = iu["url"].(string)
 			detail, _ = iu["detail"].(string)
 		}
-		_ = detail
-		return map[string]any{"type": "input_image", "image_url": url}
+		if url == "" {
+			return nil, false
+		}
+		part := map[string]any{"type": "input_image", "image_url": url}
+		if detail != "" {
+			part["detail"] = detail
+		}
+		return part, true
 	default:
-		return map[string]any{"type": "input_text", "text": fmt.Sprintf("%v", p)}
+		return nil, false
 	}
 }
 

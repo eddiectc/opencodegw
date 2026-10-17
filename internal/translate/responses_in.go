@@ -163,6 +163,15 @@ func responsesContentToText(c any) string {
 
 // ResponsesUpstreamBody normalizes a gateway Responses request into the
 // upstream Responses body for responses-native models.
+//
+// The input list is sanitized so upstream validation passes:
+//
+//   - `input_text` parts on `assistant` messages are rewritten to
+//     `output_text` (upstream returns 400 otherwise).
+//   - Empty-text parts and empty messages are dropped.
+//   - Unknown item types and non-text assistant parts (images have no
+//     assistant equivalent) are dropped rather than forwarded.
+//   - Tools are flattened to the Responses shape and empty fields omitted.
 func ResponsesUpstreamBody(req openai.ResponsesRequest, model string, defaultEffort effort.Level) map[string]any {
 	b, _ := json.Marshal(req)
 	var m map[string]any
@@ -181,5 +190,248 @@ func ResponsesUpstreamBody(req openai.ResponsesRequest, model string, defaultEff
 	if s, ok := m["stream"].(bool); !ok || !s {
 		delete(m, "stream")
 	}
+	if v, ok := m["input"]; ok {
+		m["input"] = sanitizeResponsesInput(v)
+	}
+	if len(req.Tools) > 0 {
+		m["tools"] = flattenResponsesTools(req.Tools)
+	} else {
+		delete(m, "tools")
+	}
 	return m
+}
+
+// flattenResponsesTools converts gateway tools to the flat Responses shape,
+// omitting empty optional fields that strict upstreams reject.
+func flattenResponsesTools(tools []openai.Tool) []any {
+	out := make([]any, 0, len(tools))
+	for _, t := range tools {
+		tm := map[string]any{
+			"type": "function",
+			"name": t.Function.Name,
+		}
+		if t.Function.Description != "" {
+			tm["description"] = t.Function.Description
+		}
+		if t.Function.Parameters != nil {
+			tm["parameters"] = t.Function.Parameters
+		}
+		if t.Function.Strict != nil {
+			tm["strict"] = *t.Function.Strict
+		}
+		out = append(out, tm)
+	}
+	return out
+}
+
+// sanitizeResponsesInput rewrites a Responses `input` value into
+// upstream-safe items. String input passes through; item lists are
+// normalized per role-sensitive content rules.
+func sanitizeResponsesInput(v any) any {
+	if v == nil {
+		return nil
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	b, _ := json.Marshal(v)
+	var items []map[string]any
+	if err := json.Unmarshal(b, &items); err != nil {
+		var one map[string]any
+		if err2 := json.Unmarshal(b, &one); err2 == nil {
+			items = []map[string]any{one}
+		} else {
+			return v
+		}
+	}
+	out := make([]any, 0, len(items))
+	for _, it := range items {
+		if fixed, ok := sanitizeResponsesItem(it); ok {
+			out = append(out, fixed)
+		}
+	}
+	return out
+}
+
+// sanitizeResponsesItem normalizes one input item, reporting false when the
+// item must be dropped (empty message, unknown type).
+func sanitizeResponsesItem(it map[string]any) (any, bool) {
+	t, _ := it["type"].(string)
+	if t == "" {
+		// Easy input shape: {"role":..., "content":...} without type.
+		t = "message"
+	}
+	switch t {
+	case "message":
+		role, _ := it["role"].(string)
+		if role == "" {
+			role = "user"
+		}
+		switch role {
+		case "user", "system", "developer":
+			content := sanitizeInputContent(it["content"])
+			if len(content) == 0 {
+				return nil, false
+			}
+			return map[string]any{
+				"type":    "message",
+				"role":    role,
+				"content": content,
+			}, true
+		case "assistant":
+			content := sanitizeAssistantContent(it["content"])
+			if len(content) == 0 {
+				return nil, false
+			}
+			return map[string]any{
+				"type":    "message",
+				"role":    "assistant",
+				"content": content,
+			}, true
+		default:
+			return nil, false
+		}
+	case "function_call":
+		name, _ := it["name"].(string)
+		if name == "" {
+			return nil, false
+		}
+		fc := map[string]any{
+			"type": "function_call",
+			"name": name,
+		}
+		if v, ok := it["call_id"].(string); ok && v != "" {
+			fc["call_id"] = v
+		} else if v, ok := it["id"].(string); ok && v != "" {
+			fc["call_id"] = v
+		}
+		if v, ok := it["arguments"]; ok {
+			switch a := v.(type) {
+			case string:
+				fc["arguments"] = a
+			case nil:
+				fc["arguments"] = "{}"
+			default:
+				ab, _ := json.Marshal(a)
+				fc["arguments"] = string(ab)
+			}
+		} else {
+			fc["arguments"] = "{}"
+		}
+		return fc, true
+	case "function_call_output":
+		fco := map[string]any{
+			"type": "function_call_output",
+		}
+		if v, ok := it["call_id"].(string); ok && v != "" {
+			fco["call_id"] = v
+		}
+		if v, ok := it["output"]; ok {
+			switch o := v.(type) {
+			case string:
+				fco["output"] = o
+			case nil:
+				fco["output"] = ""
+			default:
+				ob, _ := json.Marshal(o)
+				fco["output"] = string(ob)
+			}
+		} else {
+			fco["output"] = ""
+		}
+		return fco, true
+	default:
+		// Reasoning items, MCP/tool-search wrappers and other output
+		// item types cannot be replayed as input; drop them.
+		return nil, false
+	}
+}
+
+// sanitizeInputContent keeps valid user/system/developer parts and drops
+// empty ones. A bare string becomes one input_text part.
+func sanitizeInputContent(c any) []any {
+	if s, ok := c.(string); ok {
+		if s == "" {
+			return nil
+		}
+		return []any{map[string]any{"type": "input_text", "text": s}}
+	}
+	parts := contentParts(c)
+	out := make([]any, 0, len(parts))
+	for _, p := range parts {
+		switch p["type"] {
+		case "input_text":
+			if t, ok := p["text"].(string); ok && t != "" {
+				out = append(out, map[string]any{"type": "input_text", "text": t})
+			}
+		case "input_image":
+			out = append(out, p)
+		case "input_file":
+			out = append(out, p)
+		case "text":
+			// Chat-style part: normalize to input_text.
+			if t, ok := p["text"].(string); ok && t != "" {
+				out = append(out, map[string]any{"type": "input_text", "text": t})
+			}
+		}
+	}
+	return out
+}
+
+// sanitizeAssistantContent keeps valid assistant history parts. `input_text`
+// and chat `text` parts are rewritten to `output_text`; anything else
+// without an assistant equivalent is dropped.
+func sanitizeAssistantContent(c any) []any {
+	if s, ok := c.(string); ok {
+		if s == "" {
+			return nil
+		}
+		return []any{map[string]any{"type": "output_text", "text": s}}
+	}
+	parts := contentParts(c)
+	out := make([]any, 0, len(parts))
+	for _, p := range parts {
+		switch p["type"] {
+		case "output_text":
+			if t, ok := p["text"].(string); ok && t != "" {
+				out = append(out, map[string]any{"type": "output_text", "text": t})
+			}
+		case "input_text", "text":
+			if t, ok := p["text"].(string); ok && t != "" {
+				out = append(out, map[string]any{"type": "output_text", "text": t})
+			}
+		case "refusal":
+			if t, ok := p["refusal"].(string); ok && t != "" {
+				out = append(out, map[string]any{"type": "refusal", "refusal": t})
+			} else if t, ok := p["text"].(string); ok && t != "" {
+				out = append(out, map[string]any{"type": "refusal", "refusal": t})
+			}
+		}
+	}
+	return out
+}
+
+func contentParts(c any) []map[string]any {
+	if c == nil {
+		return nil
+	}
+	if arr, ok := c.([]any); ok {
+		out := make([]map[string]any, 0, len(arr))
+		for _, p := range arr {
+			if m, ok := p.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	b, _ := json.Marshal(c)
+	var parts []map[string]any
+	if err := json.Unmarshal(b, &parts); err == nil {
+		return parts
+	}
+	var one map[string]any
+	if err := json.Unmarshal(b, &one); err == nil {
+		return []map[string]any{one}
+	}
+	return nil
 }
