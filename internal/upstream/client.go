@@ -39,7 +39,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body any, extr
 			return 0, nil, nil, fmt.Errorf("marshal upstream body: %w", err)
 		}
 		if c.cfg.Debug {
-			fmt.Printf("[upstream] %s %s%s body=%s\n", method, c.cfg.UpstreamBase, path, truncate(string(b), 4000))
+			fmt.Printf("[upstream] %s %s%s body=%s\n", method, c.cfg.UpstreamBase, path, string(b))
 		}
 		rdr = bytes.NewReader(b)
 	}
@@ -74,7 +74,7 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body any, extr
 		return resp.StatusCode, nil, resp.Header, err
 	}
 	if c.cfg.Debug && !stream {
-		fmt.Printf("[upstream] status=%d body=%s\n", resp.StatusCode, truncate(string(raw), 4000))
+		fmt.Printf("[upstream] status=%d body=%s\n", resp.StatusCode, string(raw))
 	}
 	if resp.StatusCode >= 400 {
 		return resp.StatusCode, raw, resp.Header, nil
@@ -92,7 +92,7 @@ func (c *Client) DoStream(ctx context.Context, method, path string, body any, ex
 			return nil, fmt.Errorf("marshal upstream stream body: %w", err)
 		}
 		if c.cfg.Debug {
-			fmt.Printf("[upstream stream] %s %s%s body=%s\n", method, c.cfg.UpstreamBase, path, truncate(string(b), 4000))
+			fmt.Printf("[upstream stream] %s %s%s body=%s\n", method, c.cfg.UpstreamBase, path, string(b))
 		}
 		rdr = bytes.NewReader(b)
 	}
@@ -136,7 +136,7 @@ func (c *Client) DoStream(ctx context.Context, method, path string, body any, ex
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		resp.Body.Close()
 		if c.cfg.Debug {
-			fmt.Printf("[upstream stream] non-SSE status=%d content-type=%q body=%s\n", resp.StatusCode, ct, truncate(string(raw), 4000))
+			fmt.Printf("[upstream stream] non-SSE status=%d content-type=%q body=%s\n", resp.StatusCode, ct, string(raw))
 		}
 		return nil, &UpstreamError{Status: resp.StatusCode, Body: raw, Header: resp.Header}
 	}
