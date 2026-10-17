@@ -64,3 +64,33 @@ func TestBackendMappings(t *testing.T) {
 		t.Errorf("Max.GeminiLevel = %q, want HIGH (Gemini tops out at HIGH)", Max.GeminiLevel())
 	}
 }
+
+func TestClampForResponses(t *testing.T) {
+	// none must be expressed by omitting reasoning, not sending "none"
+	if got := None.ClampForResponses(); got.Valid() {
+		t.Errorf("None.ClampForResponses = %q, want unspecified (omit block)", got)
+	}
+	for _, l := range []Level{Low, Medium, High, XHigh, Max} {
+		if got := l.ClampForResponses(); got != l {
+			t.Errorf("%q.ClampForResponses = %q, want passthrough", l, got)
+		}
+	}
+	if got := Unspecified.ClampForResponses(); got.Valid() {
+		t.Errorf("Unspecified.ClampForResponses = %q, want unspecified", got)
+	}
+}
+
+func TestEnsureAnthropicMaxTokens(t *testing.T) {
+	// budget 32000 (xhigh) with default 8192 must bump above budget
+	if got := EnsureAnthropicMaxTokens(8192, 32000); got <= 32000 {
+		t.Errorf("EnsureAnthropicMaxTokens(8192, 32000) = %d, must exceed budget", got)
+	}
+	// no thinking: small explicit max passes through
+	if got := EnsureAnthropicMaxTokens(100, 0); got != 100 {
+		t.Errorf("EnsureAnthropicMaxTokens(100, 0) = %d, want 100", got)
+	}
+	// already large enough: untouched
+	if got := EnsureAnthropicMaxTokens(70000, 64000); got != 70000 {
+		t.Errorf("EnsureAnthropicMaxTokens(70000, 64000) = %d, want 70000", got)
+	}
+}

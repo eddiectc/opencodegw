@@ -14,7 +14,7 @@ import (
 // ChatToResponses converts an OpenAI Chat Completions request into an
 // OpenAI Responses request for responses-native upstream models.
 func ChatToResponses(req openai.ChatRequest, model string) map[string]any {
-	eff := EffortFromChat(req)
+	eff := EffortFromChat(req).ClampForResponses()
 	out := map[string]any{
 		"model": model,
 	}
@@ -174,9 +174,10 @@ func chatPartToResponsesPart(p any) any {
 // ChatToAnthropic converts a Chat Completions request to an Anthropic Messages request.
 func ChatToAnthropic(req openai.ChatRequest, model string) map[string]any {
 	eff := EffortFromChat(req)
+	budget := eff.AnthropicBudget()
 	out := map[string]any{
 		"model":      model,
-		"max_tokens": anthropicMaxTokens(req),
+		"max_tokens": effort.EnsureAnthropicMaxTokens(anthropicMaxTokens(req), budget),
 	}
 	var system []any
 	var messages []any
@@ -240,8 +241,11 @@ func ChatToAnthropic(req openai.ChatRequest, model string) map[string]any {
 			out["tool_choice"] = anthropicToolChoice(req.ToolChoice)
 		}
 	}
-	if budget := eff.AnthropicBudget(); budget > 0 {
+	if budget > 0 {
 		out["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
+		// Anthropic forbids temperature/top_p alongside thinking.
+		delete(out, "temperature")
+		delete(out, "top_p")
 	}
 	if req.Stream != nil && *req.Stream {
 		out["stream"] = true

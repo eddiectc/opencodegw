@@ -168,9 +168,9 @@ func ResponsesUpstreamBody(req openai.ResponsesRequest, model string, defaultEff
 	var m map[string]any
 	_ = json.Unmarshal(b, &m)
 	m["model"] = model
-	eff := EffortFromResponses(req)
+	eff := EffortFromResponses(req).ClampForResponses()
 	if !eff.Valid() {
-		eff = defaultEffort
+		eff = defaultEffort.ClampForResponses()
 	}
 	if e := eff.OpenAIEffort(); e != "" {
 		m["reasoning"] = map[string]any{"effort": e}

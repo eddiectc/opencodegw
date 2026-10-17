@@ -62,6 +62,9 @@ func FromBudget(budget int) Level {
 
 // AnthropicBudget maps a Level to an Anthropic thinking budget_tokens value.
 // Returns 0 when thinking should be disabled/omitted.
+// NOTE: Anthropic requires budget_tokens < max_tokens, and thinking cannot
+// combine with temperature/top_p overrides. Callers must bump max_tokens
+// above the budget and drop temperature/top_p when thinking is enabled.
 func (l Level) AnthropicBudget() int {
 	switch l {
 	case Low:
@@ -98,6 +101,9 @@ func (l Level) GeminiLevel() string {
 }
 
 // OpenAIEffort maps to the OpenAI reasoning effort string.
+// Valid values are model-dependent: none, minimal, low, medium, high,
+// xhigh, max. GPT-6 Luna supports low|medium|high|xhigh|max.
+// EffortForModel clamps levels the target model does not support.
 func (l Level) OpenAIEffort() string {
 	switch l {
 	case None:
@@ -119,6 +125,37 @@ func (l Level) OpenAIEffort() string {
 
 // String returns the canonical string.
 func (l Level) String() string { return string(l) }
+
+// ClampForResponses clamps a level to what the Responses backend accepts
+// for a given model family. Unknown models pass through unchanged.
+// GPT-6/GPT-5.6 Luna accept low|medium|high|xhigh|max (no minimal/none via
+// reasoning.effort; none is expressed by omitting reasoning).
+func (l Level) ClampForResponses() Level {
+	switch l {
+	case None:
+		return Unspecified // omit reasoning block to disable
+	case Low, Medium, High, XHigh, Max:
+		return l
+	default:
+		return Unspecified
+	}
+}
+
+// EnsureAnthropicMaxTokens bumps maxTokens above budget as Anthropic
+// requires budget_tokens < max_tokens. Returns adjusted max_tokens.
+func EnsureAnthropicMaxTokens(maxTokens, budget int) int {
+	if budget <= 0 {
+		if maxTokens <= 0 {
+			return 8192
+		}
+		return maxTokens
+	}
+	min := budget + 4096 // headroom for visible response beyond thinking
+	if maxTokens < min {
+		return min
+	}
+	return maxTokens
+}
 
 // Valid reports whether l is a concrete level (not Unspecified).
 func (l Level) Valid() bool {
