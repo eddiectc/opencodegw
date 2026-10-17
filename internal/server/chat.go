@@ -43,13 +43,16 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cache.mu.Unlock()
 
-	status, raw, err := s.upstream.DoRawGet(r.Context(), "v1/models")
+	status, raw, hdr, err := s.upstream.DoRawGet(r.Context(), "v1/models")
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream_error", "models fetch failed: "+err.Error())
 		return
 	}
 	if status >= 400 {
-		proxyUpstreamError(w, status, raw)
+		proxyUpstreamError(w, status, raw, hdr)
+		return
+	}
+	if proxyUpstreamBodyIfError(w, status, raw, hdr) {
 		return
 	}
 	s.cache.mu.Lock()
@@ -110,13 +113,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		s.serveChatStream(w, r, backend, path, upstreamBody, extra, model, req)
 		return
 	}
-	status, raw, _, err := s.upstream.DoJSON(r.Context(), "POST", path, upstreamBody, extra, false)
+	status, raw, hdr, err := s.upstream.DoJSON(r.Context(), "POST", path, upstreamBody, extra, false)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
 	if status >= 400 {
-		proxyUpstreamError(w, status, raw)
+		proxyUpstreamError(w, status, raw, hdr)
+		return
+	}
+	if proxyUpstreamBodyIfError(w, status, raw, hdr) {
 		return
 	}
 	var chat openai.ChatResponse
@@ -202,7 +208,7 @@ func (s *Server) serveChatStream(w http.ResponseWriter, r *http.Request, backend
 	upResp, err := s.upstream.DoStream(r.Context(), "POST", path, upstreamBody, extra)
 	if err != nil {
 		if ue, ok := err.(*upstream.UpstreamError); ok {
-			proxyUpstreamError(w, ue.Status, ue.Body)
+			proxyUpstreamError(w, ue.Status, ue.Body, ue.Header)
 			return
 		}
 		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
@@ -241,7 +247,15 @@ func (s *Server) serveChatStream(w http.ResponseWriter, r *http.Request, backend
 		terr = translate.TranslateChatStream(upResp.Body, displayModel, emit)
 	}
 	if terr != nil {
-		// Best effort: log; stream may already be partially sent.
+		// Headers are already sent: forward the failure as an SSE error
+		// event. No silent truncation, no retry.
+		if se, ok := translate.AsStreamError(terr); ok {
+			emitChatStreamError(w, fl, se.Err)
+		} else if r.Context().Err() == nil {
+			emitChatStreamError(w, fl, translate.UpstreamFailure(terr))
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		fl.Flush()
 		return
 	}
 	// If the translator swallowed upstream DONE (all but chat passthrough),
@@ -253,25 +267,4 @@ func (s *Server) serveChatStream(w http.ResponseWriter, r *http.Request, backend
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 		fl.Flush()
 	}
-}
-
-func proxyUpstreamError(w http.ResponseWriter, status int, raw []byte) {
-	// Try to surface the upstream message in OpenAI shape; fall back to raw.
-	var maybe map[string]any
-	if err := json.Unmarshal(raw, &maybe); err == nil {
-		if _, hasErr := maybe["error"]; hasErr {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(status)
-			_, _ = w.Write(raw)
-			return
-		}
-	}
-	msg := strings.TrimSpace(string(raw))
-	if msg == "" {
-		msg = http.StatusText(status)
-	}
-	if len(msg) > 2000 {
-		msg = msg[:2000] + "...(truncated)"
-	}
-	writeError(w, status, "upstream_error", msg)
 }

@@ -94,7 +94,12 @@ func strPtr(s string) *string { return &s }
 // the caller frames them as SSE.
 func TranslateChatStream(r io.Reader, fallbackModel string, emit func(chunkJSON string) bool) error {
 	var firstModel string
+	var streamErr *StreamError
 	err := ScanSSE(r, func(ev SSEEvent) bool {
+		if se, isErr := DetectSSEError(ev); isErr {
+			streamErr = se
+			return false
+		}
 		if ev.Data == "[DONE]" {
 			return emit("[DONE]")
 		}
@@ -119,6 +124,9 @@ func TranslateChatStream(r io.Reader, fallbackModel string, emit func(chunkJSON 
 		b, _ := json.Marshal(ch)
 		return emit(string(b))
 	})
+	if streamErr != nil {
+		return streamErr
+	}
 	return err
 }
 
@@ -152,8 +160,12 @@ func TranslateResponsesStreamToChat(r io.Reader, fallbackModel string, emit func
 	}
 	toolStarted := map[int]bool{}
 	toolIndex := 0
-	var retErr error
+	var streamErr *StreamError
 	err := ScanSSE(r, func(ev SSEEvent) bool {
+		if se, isErr := DetectSSEError(ev); isErr {
+			streamErr = se
+			return false
+		}
 		if ev.Data == "[DONE]" {
 			return true // swallowed; caller appends DONE after finish chunk
 		}
@@ -212,8 +224,20 @@ func TranslateResponsesStreamToChat(r io.Reader, fallbackModel string, emit func
 				toolIndex++
 			}
 			return true
-		case "response.completed", "response.failed", "response.incomplete":
+		case "response.completed", "response.incomplete":
 			return true // finish chunk emitted by caller from accumulated state
+		case "response.failed":
+			// DetectSSEError already handled failures with error details.
+			// A bare response.failed still must surface downstream.
+			streamErr = &StreamError{
+				Status: 502,
+				Err:    UpstreamFailure(nil),
+				Raw:    ev.Data,
+			}
+			streamErr.Err.Error.Message = "upstream response failed"
+			streamErr.Err.Error.Type = "response.failed"
+			streamErr.Err.Error.Code = "response.failed"
+			return false
 		default:
 			// Generic fallbacks: some servers send delta-only events with other names
 			if e.Delta != "" {
@@ -223,10 +247,9 @@ func TranslateResponsesStreamToChat(r io.Reader, fallbackModel string, emit func
 			return true
 		}
 	})
-	if err != nil {
-		retErr = err
+	if streamErr != nil {
+		return streamErr
 	}
-	_ = retErr
 	return err
 }
 
@@ -241,7 +264,12 @@ func TranslateAnthropicStreamToChat(r io.Reader, fallbackModel string, emit func
 	}
 	toolIDs := map[int]string{}
 	toolNames := map[int]string{}
-	return ScanSSE(r, func(ev SSEEvent) bool {
+	var streamErr *StreamError
+	err := ScanSSE(r, func(ev SSEEvent) bool {
+		if se, isErr := DetectSSEError(ev); isErr {
+			streamErr = se
+			return false
+		}
 		if ev.Data == "[DONE]" {
 			return true
 		}
@@ -314,6 +342,10 @@ func TranslateAnthropicStreamToChat(r io.Reader, fallbackModel string, emit func
 			return true
 		}
 	})
+	if streamErr != nil {
+		return streamErr
+	}
+	return err
 }
 
 // ---- Upstream Gemini stream -> OpenAI chat chunks ----
@@ -341,7 +373,12 @@ func TranslateGeminiStreamToChat(r io.Reader, fallbackModel string, emit func(ch
 	}
 	toolIdx := 0
 	toolOpen := false
-	return ScanSSE(r, func(ev SSEEvent) bool {
+	var streamErr *StreamError
+	err := ScanSSE(r, func(ev SSEEvent) bool {
+		if se, isErr := DetectSSEError(ev); isErr {
+			streamErr = se
+			return false
+		}
 		if ev.Data == "[DONE]" {
 			return true
 		}
@@ -386,6 +423,10 @@ func TranslateGeminiStreamToChat(r io.Reader, fallbackModel string, emit func(ch
 		}
 		return true
 	})
+	if streamErr != nil {
+		return streamErr
+	}
+	return err
 }
 
 func intIndex(v any) int {

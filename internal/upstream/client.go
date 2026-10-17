@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/eddiectc/opencodegw/internal/config"
@@ -127,15 +128,45 @@ func (c *Client) DoStream(ctx context.Context, method, path string, body any, ex
 		resp.Body.Close()
 		return nil, &UpstreamError{Status: resp.StatusCode, Body: raw, Header: resp.Header}
 	}
+	// Some upstreams answer stream requests with HTTP 200 + JSON (or plain
+	// text) carrying an error object instead of SSE. Detect that before the
+	// caller commits downstream SSE headers so the failure can be proxied as
+	// JSON with no retry and no silent truncation.
+	if ct := resp.Header.Get("Content-Type"); isNonStreamErrorContentType(ct) {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		if c.cfg.Debug {
+			fmt.Printf("[upstream stream] non-SSE status=%d content-type=%q body=%s\n", resp.StatusCode, ct, truncate(string(raw), 4000))
+		}
+		return nil, &UpstreamError{Status: resp.StatusCode, Body: raw, Header: resp.Header}
+	}
 	return resp, nil
 }
 
+// isNonStreamErrorContentType reports whether a stream response arrived with a
+// non-SSE content type that indicates a plain (likely error) body.
+func isNonStreamErrorContentType(ct string) bool {
+	lct := strings.ToLower(ct)
+	if lct == "" {
+		return false
+	}
+	if strings.Contains(lct, "text/event-stream") {
+		return false
+	}
+	// Streams are always SSE; JSON/text/HTML on a stream request is a
+	// non-stream reply (usually an error object) that must be proxied, not
+	// fed to the SSE translators.
+	return strings.Contains(lct, "application/json") ||
+		strings.Contains(lct, "text/plain") ||
+		strings.Contains(lct, "text/html")
+}
+
 // DoRawGet performs an upstream GET (used for /v1/models).
-func (c *Client) DoRawGet(ctx context.Context, path string) (int, []byte, error) {
+func (c *Client) DoRawGet(ctx context.Context, path string) (int, []byte, http.Header, error) {
 	url := c.cfg.UpstreamBase + "/" + path
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.cfg.UpstreamAPIKey)
 	if c.cfg.UserAgent != "" {
@@ -143,11 +174,11 @@ func (c *Client) DoRawGet(ctx context.Context, path string) (int, []byte, error)
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
-	return resp.StatusCode, raw, err
+	return resp.StatusCode, raw, resp.Header, err
 }
 
 // UpstreamError is a non-2xx from streaming setup.

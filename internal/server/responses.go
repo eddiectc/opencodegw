@@ -10,6 +10,7 @@ import (
 	"github.com/eddiectc/opencodegw/internal/models"
 	"github.com/eddiectc/opencodegw/internal/openai"
 	"github.com/eddiectc/opencodegw/internal/translate"
+	"github.com/eddiectc/opencodegw/internal/upstream"
 )
 
 // ---- /v1/responses ----
@@ -48,13 +49,16 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if backend == models.BackendResponses {
 		upBody := translate.ResponsesUpstreamBody(req, model, defEff)
 		path := models.UpstreamPath(backend, model, false)
-		status, raw, _, err := s.upstream.DoJSON(r.Context(), "POST", path, upBody, extra, false)
+		status, raw, hdr, err := s.upstream.DoJSON(r.Context(), "POST", path, upBody, extra, false)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 			return
 		}
 		if status >= 400 {
-			proxyUpstreamError(w, status, raw)
+			proxyUpstreamError(w, status, raw, hdr)
+			return
+		}
+		if proxyUpstreamBodyIfError(w, status, raw, hdr) {
 			return
 		}
 		rr, err := translate.ResponsesPassthrough(raw, req.Model)
@@ -81,7 +85,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	if perr != nil {
 		if ue, ok := perr.(*upstreamErr); ok {
-			proxyUpstreamError(w, ue.status, ue.body)
+			proxyUpstreamError(w, ue.status, ue.body, ue.header)
 			return
 		}
 		writeError(w, http.StatusBadGateway, "upstream_error", perr.Error())
@@ -94,6 +98,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 type upstreamErr struct {
 	status int
 	body   []byte
+	header http.Header
 }
 
 func (e *upstreamErr) Error() string { return http.StatusText(e.status) }
@@ -113,12 +118,19 @@ func (s *Server) doChatBackend(r *http.Request, backend models.Backend, model st
 		upstreamBody = chatPassthroughBody(chatReq, model)
 		path = models.UpstreamPath(backend, model, false)
 	}
-	status, raw, _, err := s.upstream.DoJSON(r.Context(), "POST", path, upstreamBody, extra, false)
+	status, raw, hdr, err := s.upstream.DoJSON(r.Context(), "POST", path, upstreamBody, extra, false)
 	if err != nil {
 		return openai.ChatResponse{}, err
 	}
 	if status >= 400 {
-		return openai.ChatResponse{}, &upstreamErr{status: status, body: raw}
+		return openai.ChatResponse{}, &upstreamErr{status: status, body: raw, header: hdr}
+	}
+	if oe, ok := translate.ErrorFromBytes(raw); ok {
+		return openai.ChatResponse{}, &upstreamErr{
+			status: http.StatusBadGateway,
+			body:   []byte(translate.OpenAIErrorBytes(oe)),
+			header: hdr,
+		}
 	}
 	switch backend {
 	case models.BackendMessages:
@@ -137,14 +149,61 @@ func (s *Server) doChatBackend(r *http.Request, backend models.Backend, model st
 // model echo is unnecessary since bodies are already Responses-shaped).
 // For other backends we run the chat stream translators but frame output
 // as Responses SSE events.
+//
+// Upstream setup failures are proxied as JSON errors before SSE headers are
+// sent. Mid-stream failures ride the stream as response.failed + error events
+// because headers are already committed. No retries anywhere.
 func (s *Server) serveResponsesStream(w http.ResponseWriter, r *http.Request, backend models.Backend, model string, req openai.ResponsesRequest, defEff effort.Level, extra http.Header) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	fl, _ := w.(http.Flusher)
+	sendSSEHeaders := func() http.Flusher {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		return fl
+	}
 
+	// Build the upstream request without touching the downstream headers so
+	// setup errors can still be proxied as JSON with the upstream status.
+	var upstreamBody any
+	var path string
+	if backend == models.BackendResponses {
+		upBody := translate.ResponsesUpstreamBody(req, model, defEff)
+		upBody["stream"] = true
+		upstreamBody = upBody
+		path = models.UpstreamPath(backend, model, false)
+	} else {
+		chatReq := translate.ResponsesToChatRequest(req, defEff)
+		chatReq.Model = req.Model
+		switch backend {
+		case models.BackendMessages:
+			m := translate.ChatToAnthropic(chatReq, model)
+			m["stream"] = true
+			upstreamBody = m
+			path = models.UpstreamPath(backend, model, false)
+		case models.BackendGemini:
+			upstreamBody = translate.ChatToGemini(chatReq, model)
+			path = models.UpstreamPath(backend, model, true)
+		default:
+			m := chatPassthroughBody(chatReq, model)
+			m["stream"] = true
+			upstreamBody = m
+			path = models.UpstreamPath(backend, model, false)
+		}
+	}
+	upResp, err := s.upstream.DoStream(r.Context(), "POST", path, upstreamBody, extra)
+	if err != nil {
+		if ue, ok := err.(*upstream.UpstreamError); ok {
+			proxyUpstreamError(w, ue.Status, ue.Body, ue.Header)
+			return
+		}
+		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		return
+	}
+	defer upResp.Body.Close()
+
+	fl := sendSSEHeaders()
 	emitRaw := func(event, data string) bool {
 		if event != "" {
 			_, _ = io.WriteString(w, "event: "+event+"\n")
@@ -155,59 +214,38 @@ func (s *Server) serveResponsesStream(w http.ResponseWriter, r *http.Request, ba
 	}
 
 	if backend == models.BackendResponses {
-		upBody := translate.ResponsesUpstreamBody(req, model, defEff)
-		upBody["stream"] = true
-		path := models.UpstreamPath(backend, model, false)
-		upResp, err := s.upstream.DoStream(r.Context(), "POST", path, upBody, extra)
-		if err != nil {
-			return
-		}
-		defer upResp.Body.Close()
-		// Relay upstream events verbatim.
-		_ = translate.ScanSSE(upResp.Body, func(ev translate.SSEEvent) bool {
+		respID := "resp_" + newReqID()
+		scanErr := translate.ScanSSE(upResp.Body, func(ev translate.SSEEvent) bool {
 			if ev.Data == "[DONE]" {
 				_, _ = io.WriteString(w, "data: [DONE]\n\n")
 				fl.Flush()
 				return true
 			}
+			if se, isErr := translate.DetectSSEError(ev); isErr {
+				if id := extractResponsesID(ev.Data); id != "" {
+					respID = id
+				}
+				// Relay the raw error event verbatim, then the normalized form.
+				emitRaw(ev.Event, ev.Data)
+				emitResponsesStreamError(emitRaw, respID, se.Err)
+				return false
+			}
+			if id := extractResponsesID(ev.Data); id != "" {
+				respID = id
+			}
 			return emitRaw(ev.Event, ev.Data)
 		})
+		if scanErr != nil && r.Context().Err() == nil {
+			emitResponsesStreamError(emitRaw, respID, translate.UpstreamFailure(scanErr))
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		fl.Flush()
 		return
 	}
 
 	// Non-responses backends: synthesize a minimal Responses event sequence
-	// from chat chunks. We run the upstream chat stream, convert to chat
-	// chunks in memory via the translators is complex; simpler: run the
-	// non-streaming chat call... no — instead relay translated chat deltas
-	// wrapped as response.output_text.delta events.
-	chatReq := translate.ResponsesToChatRequest(req, defEff)
-	chatReq.Model = req.Model
-	var upstreamBody any
-	var path string
-	isGeminiStream := false
-	switch backend {
-	case models.BackendMessages:
-		m := translate.ChatToAnthropic(chatReq, model)
-		m["stream"] = true
-		upstreamBody = m
-		path = models.UpstreamPath(backend, model, false)
-	case models.BackendGemini:
-		upstreamBody = translate.ChatToGemini(chatReq, model)
-		path = models.UpstreamPath(backend, model, true)
-		isGeminiStream = true
-		_ = isGeminiStream
-	default:
-		m := chatPassthroughBody(chatReq, model)
-		m["stream"] = true
-		upstreamBody = m
-		path = models.UpstreamPath(backend, model, false)
-	}
-	upResp, err := s.upstream.DoStream(r.Context(), "POST", path, upstreamBody, extra)
-	if err != nil {
-		return
-	}
-	defer upResp.Body.Close()
-
+	// from chat chunks by relaying translated chat deltas wrapped as
+	// response.output_text.delta events.
 	respID := "resp_" + newReqID()
 	emitRaw("response.created", `{"type":"response.created","response":{"id":"`+respID+`","object":"response","model":"`+req.Model+`"}}`)
 	// Collect text via the chat translators by capturing their emitted chunks.
@@ -254,15 +292,42 @@ func (s *Server) serveResponsesStream(w http.ResponseWriter, r *http.Request, ba
 		}
 		return true
 	}
+	var terr error
 	switch backend {
 	case models.BackendMessages:
-		_ = translate.TranslateAnthropicStreamToChat(upResp.Body, req.Model, emit)
+		terr = translate.TranslateAnthropicStreamToChat(upResp.Body, req.Model, emit)
 	case models.BackendGemini:
-		_ = translate.TranslateGeminiStreamToChat(upResp.Body, req.Model, emit)
+		terr = translate.TranslateGeminiStreamToChat(upResp.Body, req.Model, emit)
 	default:
-		_ = translate.TranslateChatStream(upResp.Body, req.Model, emit)
+		terr = translate.TranslateChatStream(upResp.Body, req.Model, emit)
+	}
+	if terr != nil {
+		if se, ok := translate.AsStreamError(terr); ok {
+			emitResponsesStreamError(emitRaw, respID, se.Err)
+		} else if r.Context().Err() == nil {
+			emitResponsesStreamError(emitRaw, respID, translate.UpstreamFailure(terr))
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		fl.Flush()
+		return
 	}
 	emitRaw("response.completed", `{"type":"response.completed","response":{"id":"`+respID+`","status":"completed"}}`)
 	_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	fl.Flush()
+}
+
+func extractResponsesID(data string) string {
+	var probe struct {
+		Response *struct {
+			ID string `json:"id"`
+		} `json:"response"`
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(data), &probe); err != nil {
+		return ""
+	}
+	if probe.Response != nil && probe.Response.ID != "" {
+		return probe.Response.ID
+	}
+	return probe.ID
 }
