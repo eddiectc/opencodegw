@@ -78,6 +78,11 @@ Model names are normalized (lowercased, `opencode-go/` prefix stripped).
 
 Upstream always receives `Authorization: Bearer <OPENCODE_API_KEY>`, a real `User-Agent`, and an `x-opencode-session` (forwarded if the client sent one, else generated) for routing/prompt caching.
 
+Upstream 400s are proxied with no retry. Two refinements on the Responses path (verified by live probes against `muse-spark-1.3-contributor`):
+
+- **Tool pairing**: every `function_call` needs exactly one matching `function_call_output` (upstream rejects orphans and duplicates with 400). The gateway drops unmatched calls/outputs and keeps the first output per `call_id` before sending.
+- **Context overflow**: upstream answers over-window input with a detail-free 400. When the request estimates at or above the model's known window (`muse-spark-1.x-contributor`: 1M tokens), the gateway rewrites it to `code: context_length_exceeded` with the estimate, so clients compact and retry instead of guessing.
+
 ## Config
 
 | Env | Flag | Default |
