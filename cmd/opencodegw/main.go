@@ -1,4 +1,4 @@
-// Command opencodegw is an OpenAI-compatible gateway for OpenCode Go.
+// Command opencodegw is a multi-dialect gateway for OpenCode Go.
 package main
 
 import (

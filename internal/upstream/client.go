@@ -54,16 +54,10 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, body any, extr
 	if c.cfg.UserAgent != "" {
 		req.Header.Set("User-Agent", c.cfg.UserAgent)
 	}
-	// Forward session + correlation headers if the caller supplied them.
-	for k, vs := range extraHeaders {
-		lk := http.CanonicalHeaderKey(k)
-		switch lk {
-		case "X-Opencode-Session", "X-Session-Id", "X-Request-Id", "Anthropic-Beta", "X-Api-Key":
-			for _, v := range vs {
-				req.Header.Add(lk, v)
-			}
-		}
-	}
+	// Forward session + correlation + native version headers. Auth keys are
+	// deliberately absent: client credentials authenticate to the gateway
+	// only; upstream always uses Bearer <OPENCODE_API_KEY>.
+	forwardExtraHeaders(req, extraHeaders)
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return 0, nil, nil, fmt.Errorf("upstream request failed: %w", err)
@@ -108,15 +102,7 @@ func (c *Client) DoStream(ctx context.Context, method, path string, body any, ex
 	if c.cfg.UserAgent != "" {
 		req.Header.Set("User-Agent", c.cfg.UserAgent)
 	}
-	for k, vs := range extraHeaders {
-		lk := http.CanonicalHeaderKey(k)
-		switch lk {
-		case "X-Opencode-Session", "X-Session-Id", "X-Request-Id", "Anthropic-Beta":
-			for _, v := range vs {
-				req.Header.Add(lk, v)
-			}
-		}
-	}
+	forwardExtraHeaders(req, extraHeaders)
 	// Long-lived client without the short timeout for streams.
 	hc := &http.Client{Timeout: 0}
 	resp, err := hc.Do(req)
@@ -197,6 +183,20 @@ func acceptHeader(stream bool) string {
 		return "text/event-stream"
 	}
 	return "application/json"
+}
+
+// forwardExtraHeaders copies the allowlisted session/correlation/version
+// headers onto the upstream request. Auth material is never forwarded.
+func forwardExtraHeaders(req *http.Request, extraHeaders http.Header) {
+	for k, vs := range extraHeaders {
+		switch http.CanonicalHeaderKey(k) {
+		case "X-Opencode-Session", "X-Session-Id", "X-Request-Id",
+			"Anthropic-Beta", "Anthropic-Version", "Openai-Beta":
+			for _, v := range vs {
+				req.Header.Add(http.CanonicalHeaderKey(k), v)
+			}
+		}
+	}
 }
 
 func truncate(s string, n int) string {

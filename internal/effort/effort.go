@@ -82,6 +82,22 @@ func (l Level) AnthropicBudget() int {
 	}
 }
 
+// FromGeminiLevel maps a Gemini thinkingLevel back to a canonical Level.
+func FromGeminiLevel(s string) Level {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "MINIMAL", "NONE":
+		return None
+	case "LOW":
+		return Low
+	case "MEDIUM":
+		return Medium
+	case "HIGH":
+		return High
+	default:
+		return Unspecified
+	}
+}
+
 // GeminiLevel maps to Gemini thinkingLevel strings.
 func (l Level) GeminiLevel() string {
 	switch l {

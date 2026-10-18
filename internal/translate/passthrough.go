@@ -129,6 +129,61 @@ func EffortFromResponsesRaw(raw []byte) effort.Level {
 	return effortFromResponsesRawMap(m)
 }
 
+// EffortFromRawMap reads canonical effort from gateway alias spellings in a
+// raw request map (any ingress dialect): top-level reasoning_effort,
+// reasoningEffort, effort, thinking_effort strings (or 0-5 numbers), the
+// reasoning.effort object form, and thinking blocks (effort string,
+// budget_tokens, or type disabled -> none). A native Anthropic thinking
+// block with a budget maps back to the nearest level. Reports Unspecified
+// when no alias is present.
+func EffortFromRawMap(m map[string]any) effort.Level {
+	for _, k := range []string{"reasoning_effort", "reasoningEffort", "effort", "thinking_effort"} {
+		if s, ok := m[k].(string); ok {
+			if l := effort.Normalize(s); l.Valid() {
+				return l
+			}
+		}
+		if f, ok := m[k].(float64); ok {
+			if l := effort.Normalize(floatToString(f)); l.Valid() {
+				return l
+			}
+		}
+	}
+	if rm, ok := m["reasoning"].(map[string]any); ok {
+		if s, ok := rm["effort"].(string); ok {
+			if l := effort.Normalize(s); l.Valid() {
+				return l
+			}
+		}
+	}
+	switch th := m["thinking"].(type) {
+	case string:
+		if l := effort.Normalize(th); l.Valid() {
+			return l
+		}
+	case map[string]any:
+		if s, ok := th["effort"].(string); ok {
+			if l := effort.Normalize(s); l.Valid() {
+				return l
+			}
+		}
+		if b := intJSON(th["budget_tokens"]); b > 0 {
+			return effort.FromBudget(b)
+		}
+		if s, ok := th["type"].(string); ok && strings.EqualFold(s, "disabled") {
+			return effort.None
+		}
+	}
+	if gc, ok := m["generationConfig"].(map[string]any); ok {
+		if tc, ok := gc["thinkingConfig"].(map[string]any); ok {
+			if s, ok := tc["thinkingLevel"].(string); ok {
+				return effort.FromGeminiLevel(s)
+			}
+		}
+	}
+	return effort.Unspecified
+}
+
 // effortFromResponsesRawMap reads effort aliases that the ResponsesRequest
 // struct does not decode (clients may send any alias to any endpoint).
 func effortFromResponsesRawMap(m map[string]any) effort.Level {

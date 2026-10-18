@@ -116,6 +116,9 @@ func (s *Server) doChatBackend(r *http.Request, backend models.Backend, model st
 	case models.BackendGemini:
 		upstreamBody = translate.ChatToGemini(chatReq, model)
 		path = models.UpstreamPath(backend, model, false)
+	case models.BackendResponses:
+		upstreamBody = translate.ChatToResponses(chatReq, model)
+		path = models.UpstreamPath(backend, model, false)
 	default:
 		upstreamBody = chatPassthroughBody(chatReq, model)
 		path = models.UpstreamPath(backend, model, false)
