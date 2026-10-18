@@ -91,3 +91,71 @@ func TestProxyUpstreamBodyIfError(t *testing.T) {
 		t.Fatalf("false positive on success body")
 	}
 }
+
+const generic400 = `{"model":"muse-spark-1.3-contributor","error":{"code":null,"message":"The request contains invalid parameters. Check the request body for any errors or inconsistencies.","param":null,"type":"invalid_request_error"}}`
+
+// An over-window request hitting upstream's detail-free 400 must surface as
+// context_length_exceeded (status preserved) so clients compact and retry.
+func TestProxyUpstreamErrorRewritesLikelyOverflow(t *testing.T) {
+	w := httptest.NewRecorder()
+	proxyUpstreamErrorWith(w, 400, []byte(generic400), nil, upstreamFailure{
+		estTokens: 1200000,
+		window:    1000000,
+		model:     "muse-spark-1.3-contributor",
+	})
+	res := w.Result()
+	defer res.Body.Close()
+	if res.StatusCode != 400 {
+		t.Fatalf("status = %d, want 400", res.StatusCode)
+	}
+	var oe openai.ErrorResponse
+	if err := json.NewDecoder(res.Body).Decode(&oe); err != nil {
+		t.Fatal(err)
+	}
+	if oe.Error.Code != "context_length_exceeded" {
+		t.Errorf("code = %v, want context_length_exceeded: %+v", oe.Error.Code, oe.Error)
+	}
+	if oe.Error.Type != "invalid_request_error" {
+		t.Errorf("type = %q, want invalid_request_error", oe.Error.Type)
+	}
+}
+
+// Same generic 400 on a small request (or unknown window) must pass through
+// verbatim: the cause is genuinely unknown (e.g. an unmatched tool call the
+// client must fix).
+func TestProxyUpstreamErrorKeepsGenericSmallBody(t *testing.T) {
+	for _, fail := range []upstreamFailure{
+		{estTokens: 1000, window: 1000000, model: "muse-spark-1.3-contributor"},
+		{estTokens: 5000000, window: 0, model: "some-future-model"},
+		{},
+	} {
+		w := httptest.NewRecorder()
+		proxyUpstreamErrorWith(w, 400, []byte(generic400), nil, fail)
+		var body map[string]any
+		if err := json.NewDecoder(w.Result().Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		errObj, _ := body["error"].(map[string]any)
+		if errObj["message"] != "The request contains invalid parameters. Check the request body for any errors or inconsistencies." {
+			t.Errorf("fail=%+v: body rewritten: %v", fail, body)
+		}
+	}
+}
+
+// Specific upstream errors are never rewritten, even over window.
+func TestProxyUpstreamErrorNeverRewritesSpecific(t *testing.T) {
+	raw := `{"error":{"message":"No function call found for function call output with call_id 'x'","param":"call_id","type":"invalid_request_error"}}`
+	w := httptest.NewRecorder()
+	proxyUpstreamErrorWith(w, 400, []byte(raw), nil, upstreamFailure{
+		estTokens: 2000000,
+		window:    1000000,
+		model:     "muse-spark-1.3-contributor",
+	})
+	var oe openai.ErrorResponse
+	if err := json.NewDecoder(w.Result().Body).Decode(&oe); err != nil {
+		t.Fatal(err)
+	}
+	if oe.Error.Code == "context_length_exceeded" {
+		t.Errorf("specific error rewritten: %+v", oe.Error)
+	}
+}

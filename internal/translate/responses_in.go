@@ -250,6 +250,78 @@ func sanitizeResponsesInput(v any) any {
 			out = append(out, fixed)
 		}
 	}
+	return matchToolPairs(out)
+}
+
+// matchToolPairs enforces the Responses pairing rule upstream validates:
+// every function_call needs exactly one matching function_call_output with
+// the same call_id.
+//
+// Live probes (2026-10-18, muse-spark-1.3-contributor) proved:
+//   - an unmatched call fails even on a tiny 68KB body (generic 400);
+//   - an output without its call fails ("No function call found ...");
+//   - duplicate outputs for one call fail ("Duplicate function_call_output
+//     ... exactly one matching function_call_output");
+//   - order does not matter (output-before-call passes) and duplicate
+//     calls with one output pass.
+//
+// So: drop calls with no output, drop outputs with no call, and keep only
+// the first output per call_id. Non-tool items pass through untouched and
+// relative order is preserved.
+func matchToolPairs(items []any) []any {
+	if len(items) == 0 {
+		return items
+	}
+	const (
+		other  = 0
+		call   = 1
+		output = 2
+	)
+	kinds := make([]uint8, len(items))
+	ids := make([]string, len(items))
+	calls := map[string]int{}
+	outs := map[string]int{}
+	for i, it := range items {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		t, _ := m["type"].(string)
+		id, _ := m["call_id"].(string)
+		switch t {
+		case "function_call":
+			kinds[i] = call
+			if id == "" {
+				continue // unmatchable: dropped below
+			}
+			ids[i] = id
+			calls[id]++
+		case "function_call_output":
+			kinds[i] = output
+			if id == "" {
+				continue // unmatchable: dropped below
+			}
+			ids[i] = id
+			outs[id]++
+		}
+	}
+	keptOut := map[string]bool{}
+	out := make([]any, 0, len(items))
+	for i, it := range items {
+		switch kinds[i] {
+		case call:
+			if outs[ids[i]] > 0 {
+				out = append(out, it)
+			}
+		case output:
+			if calls[ids[i]] > 0 && !keptOut[ids[i]] {
+				keptOut[ids[i]] = true
+				out = append(out, it)
+			}
+		default:
+			out = append(out, it)
+		}
+	}
 	return out
 }
 

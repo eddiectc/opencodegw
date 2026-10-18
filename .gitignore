@@ -1,3 +1,6 @@
 # Build artifacts
 /opencodegw
 *.test
+
+# Local debug captures
+*.log

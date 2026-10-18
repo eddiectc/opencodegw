@@ -57,3 +57,15 @@ func TestUpstreamPath(t *testing.T) {
 		t.Errorf("gemini stream path = %q", p)
 	}
 }
+
+func TestContextWindow(t *testing.T) {
+	if got := ContextWindow("muse-spark-1.3-contributor"); got != 1000000 {
+		t.Errorf("muse-spark-1.3 = %d, want 1000000", got)
+	}
+	if got := ContextWindow("opencode-go/MUSE-SPARK-1.2-CONTRIBUTOR"); got != 1000000 {
+		t.Errorf("normalized 1.2 = %d, want 1000000", got)
+	}
+	if got := ContextWindow("kimi-k3"); got != 0 {
+		t.Errorf("unknown model = %d, want 0", got)
+	}
+}

@@ -109,8 +109,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	extra := sessionHeaders(r)
+	fail := classifyUpstreamBody(upstreamBody, req.Model, model)
 	if stream {
-		s.serveChatStream(w, r, backend, path, upstreamBody, extra, model, req)
+		s.serveChatStream(w, r, backend, path, upstreamBody, extra, model, req, fail)
 		return
 	}
 	status, raw, hdr, err := s.upstream.DoJSON(r.Context(), "POST", path, upstreamBody, extra, false)
@@ -119,7 +120,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if status >= 400 {
-		proxyUpstreamError(w, status, raw, hdr)
+		proxyUpstreamErrorWith(w, status, raw, hdr, fail)
 		return
 	}
 	if proxyUpstreamBodyIfError(w, status, raw, hdr) {
@@ -187,7 +188,7 @@ func applyDefaultEffortResponses(req *openai.ResponsesRequest, def string) {
 
 // ---- streaming ----
 
-func (s *Server) serveChatStream(w http.ResponseWriter, r *http.Request, backend models.Backend, path string, upstreamBody any, extra http.Header, model string, req openai.ChatRequest) {
+func (s *Server) serveChatStream(w http.ResponseWriter, r *http.Request, backend models.Backend, path string, upstreamBody any, extra http.Header, model string, req openai.ChatRequest, fail upstreamFailure) {
 	// Mark upstream body as streaming where the dialect supports it.
 	switch b := upstreamBody.(type) {
 	case map[string]any:
@@ -208,7 +209,7 @@ func (s *Server) serveChatStream(w http.ResponseWriter, r *http.Request, backend
 	upResp, err := s.upstream.DoStream(r.Context(), "POST", path, upstreamBody, extra)
 	if err != nil {
 		if ue, ok := err.(*upstream.UpstreamError); ok {
-			proxyUpstreamError(w, ue.Status, ue.Body, ue.Header)
+			proxyUpstreamErrorWith(w, ue.Status, ue.Body, ue.Header, fail)
 			return
 		}
 		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())

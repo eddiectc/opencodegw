@@ -225,6 +225,39 @@ func UpstreamFailure(err error) openai.ErrorResponse {
 	}
 }
 
+// genericInvalidParams matches upstream's uninformative 400 for requests the
+// model endpoint rejects without detail:
+//
+//	{"model": "...", "error": {"code": null, "message": "The request contains
+//	invalid parameters. ...", "param": null, "type": "invalid_request_error"}}
+//
+// Live probes (2026-10-18, muse-spark-1.3-contributor) proved this exact
+// shape is returned both for unmatched function_call items and for input
+// token counts above the model's context window, so the gateway uses the
+// request body's estimated tokens plus the model's known window to decide
+// whether to surface a clearer context_length_exceeded error.
+const genericInvalidParams = "The request contains invalid parameters."
+
+// IsGenericInvalidParams reports whether raw is upstream's detail-free 400.
+func IsGenericInvalidParams(raw []byte) bool {
+	var top struct {
+		Error *struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Param   any    `json:"param"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return false
+	}
+	if top.Error == nil {
+		return false
+	}
+	return top.Error.Type == "invalid_request_error" &&
+		top.Error.Param == nil &&
+		strings.Contains(top.Error.Message, genericInvalidParams)
+}
+
 func firstString(m map[string]any, keys ...string) string {
 	for _, k := range keys {
 		if s, ok := m[k].(string); ok && strings.TrimSpace(s) != "" {

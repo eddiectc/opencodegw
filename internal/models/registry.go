@@ -99,6 +99,20 @@ func Normalize(model string) string {
 	return strings.ToLower(m)
 }
 
+// ContextWindow returns the model's input context window in tokens, or 0
+// when unknown. Windows are publisher-published figures (muse-spark-1.3 is
+// 1M; probes on 2026-10-18 showed its upstream 400 flipping between ~1.10M
+// and ~1.14M o200k tokens, consistent within tokenizer difference).
+// Unknown models return 0 so the gateway never guesses.
+func ContextWindow(model string) int {
+	switch Normalize(model) {
+	case "muse-spark-1.3-contributor", "muse-spark-1.2-contributor":
+		return 1000000
+	default:
+		return 0
+	}
+}
+
 // UpstreamPath returns the path (relative to base) for a backend + model.
 func UpstreamPath(backend Backend, model string, stream bool) string {
 	switch backend {

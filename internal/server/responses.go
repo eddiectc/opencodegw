@@ -49,13 +49,14 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if backend == models.BackendResponses {
 		upBody := translate.ResponsesUpstreamBody(req, model, defEff)
 		path := models.UpstreamPath(backend, model, false)
+		fail := classifyUpstreamBody(upBody, req.Model, model)
 		status, raw, hdr, err := s.upstream.DoJSON(r.Context(), "POST", path, upBody, extra, false)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 			return
 		}
 		if status >= 400 {
-			proxyUpstreamError(w, status, raw, hdr)
+			proxyUpstreamErrorWith(w, status, raw, hdr, fail)
 			return
 		}
 		if proxyUpstreamBodyIfError(w, status, raw, hdr) {
@@ -85,7 +86,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	if perr != nil {
 		if ue, ok := perr.(*upstreamErr); ok {
-			proxyUpstreamError(w, ue.status, ue.body, ue.header)
+			proxyUpstreamErrorWith(w, ue.status, ue.body, ue.header, ue.fail)
 			return
 		}
 		writeError(w, http.StatusBadGateway, "upstream_error", perr.Error())
@@ -99,6 +100,7 @@ type upstreamErr struct {
 	status int
 	body   []byte
 	header http.Header
+	fail   upstreamFailure
 }
 
 func (e *upstreamErr) Error() string { return http.StatusText(e.status) }
@@ -122,14 +124,16 @@ func (s *Server) doChatBackend(r *http.Request, backend models.Backend, model st
 	if err != nil {
 		return openai.ChatResponse{}, err
 	}
+	fail := classifyUpstreamBody(upstreamBody, chatReq.Model, model)
 	if status >= 400 {
-		return openai.ChatResponse{}, &upstreamErr{status: status, body: raw, header: hdr}
+		return openai.ChatResponse{}, &upstreamErr{status: status, body: raw, header: hdr, fail: fail}
 	}
 	if oe, ok := translate.ErrorFromBytes(raw); ok {
 		return openai.ChatResponse{}, &upstreamErr{
 			status: http.StatusBadGateway,
 			body:   []byte(translate.OpenAIErrorBytes(oe)),
 			header: hdr,
+			fail:   fail,
 		}
 	}
 	switch backend {
@@ -195,7 +199,7 @@ func (s *Server) serveResponsesStream(w http.ResponseWriter, r *http.Request, ba
 	upResp, err := s.upstream.DoStream(r.Context(), "POST", path, upstreamBody, extra)
 	if err != nil {
 		if ue, ok := err.(*upstream.UpstreamError); ok {
-			proxyUpstreamError(w, ue.Status, ue.Body, ue.Header)
+			proxyUpstreamErrorWith(w, ue.Status, ue.Body, ue.Header, classifyUpstreamBody(upstreamBody, req.Model, model))
 			return
 		}
 		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())

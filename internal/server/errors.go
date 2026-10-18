@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -10,15 +11,55 @@ import (
 	"github.com/eddiectc/opencodegw/internal/translate"
 )
 
+// upstreamFailure describes the request that failed upstream so error
+// classification can consider request size against the model's window.
+type upstreamFailure struct {
+	// estTokens estimates the upstream request body in tokens (bytes/4).
+	estTokens int
+	// window is the model's context window in tokens, 0 when unknown.
+	window int
+	// model echoes the requested model id for error messages.
+	model string
+}
+
+func (f upstreamFailure) likelyOverflow() bool {
+	return f.window > 0 && f.estTokens >= f.window
+}
+
 // proxyUpstreamError forwards an upstream failure downstream with no retry.
 // It preserves the upstream status code and Retry-After headers where present,
 // passes OpenAI-shaped bodies through verbatim, and normalizes Anthropic/Gemini
 // error shapes into OpenAI shape so downstream clients can parse them.
 func proxyUpstreamError(w http.ResponseWriter, status int, raw []byte, hdr http.Header) {
+	proxyUpstreamErrorWith(w, status, raw, hdr, upstreamFailure{})
+}
+
+// proxyUpstreamErrorWith behaves like proxyUpstreamError, except that a
+// detail-free upstream 400 on a request estimated at or above the model's
+// known context window is rewritten to a context_length_exceeded error so
+// downstream clients can act on it (upstream returns the same generic
+// message for several unrelated causes).
+func proxyUpstreamErrorWith(w http.ResponseWriter, status int, raw []byte, hdr http.Header, fail upstreamFailure) {
 	if status < 400 {
 		status = http.StatusBadGateway
 	}
 	forwardRetryHeaders(w, hdr)
+	if status == http.StatusBadRequest && fail.likelyOverflow() && translate.IsGenericInvalidParams(raw) {
+		// Upstream's detail-free 400 on an over-window request: rewrite to
+		// the standard context error (status preserved) with the window
+		// and estimate so clients can compact instead of guessing.
+		writeJSON(w, status, openai.ErrorResponse{
+			Error: openai.ErrorBody{
+				Message: fmt.Sprintf(
+					"input tokens (~%d estimated) exceed %s context window (%d tokens); compact history or tool outputs and retry",
+					fail.estTokens, fail.model, fail.window,
+				),
+				Type: "invalid_request_error",
+				Code: "context_length_exceeded",
+			},
+		})
+		return
+	}
 	var top map[string]any
 	if err := json.Unmarshal(raw, &top); err == nil {
 		if _, hasErr := top["error"]; hasErr {

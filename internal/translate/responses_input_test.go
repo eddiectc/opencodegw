@@ -2,6 +2,7 @@ package translate
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/eddiectc/opencodegw/internal/effort"
@@ -275,4 +276,143 @@ func TestToolUnmarshalFlatResponsesShape(t *testing.T) {
 func roleOf(m map[string]any) string {
 	r, _ := m["role"].(string)
 	return r
+}
+
+// Upstream rejects any function_call without exactly one matching
+// function_call_output (live probes 2026-10-18: unmatched call fails even on
+// a 68KB body; orphan outputs and duplicate outputs fail with explicit
+// messages). The sanitizer must drop orphans on both sides and keep only
+// the first output per call_id.
+func TestMatchToolPairsDropsOrphans(t *testing.T) {
+	items := []any{
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "hi"}}},
+		map[string]any{"type": "function_call", "call_id": "lonely", "name": "bash", "arguments": "{}"},
+		map[string]any{"type": "function_call", "call_id": "ok", "name": "bash", "arguments": "{}"},
+		map[string]any{"type": "function_call_output", "call_id": "ok", "output": "fine"},
+		map[string]any{"type": "function_call_output", "call_id": "orphan", "output": "x"},
+		map[string]any{"type": "function_call", "call_id": "dup", "name": "bash", "arguments": "{}"},
+		map[string]any{"type": "function_call_output", "call_id": "dup", "output": "first"},
+		map[string]any{"type": "function_call_output", "call_id": "dup", "output": "second"},
+	}
+	got := matchToolPairs(items)
+	// order: lonely dropped, orphan dropped, second dup output dropped
+	want := []string{"message", "function_call", "function_call_output", "function_call", "function_call_output"}
+	var types []string
+	var outs []string
+	for _, it := range got {
+		m, _ := it.(map[string]any)
+		types = append(types, m["type"].(string))
+		if m["type"] == "function_call_output" {
+			outs = append(outs, m["output"].(string))
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("items = %d, want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if types[i] != want[i] {
+			t.Fatalf("types = %v, want %v", types, want)
+		}
+	}
+	if len(outs) != 2 || outs[0] != "fine" || outs[1] != "first" {
+		t.Errorf("outputs = %v, want [fine first]", outs)
+	}
+}
+
+// Order must not matter: output-before-call passes upstream, so the matcher
+// keeps the pair regardless of positions.
+func TestMatchToolPairsKeepsReordered(t *testing.T) {
+	items := []any{
+		map[string]any{"type": "function_call_output", "call_id": "a", "output": "early"},
+		map[string]any{"type": "function_call", "call_id": "a", "name": "bash", "arguments": "{}"},
+	}
+	got := matchToolPairs(items)
+	if len(got) != 2 {
+		t.Fatalf("items = %d, want 2: %v", len(got), got)
+	}
+}
+
+// The matcher runs on both Responses entry points: the chat translator and
+// the Responses passthrough sanitizer.
+func TestToolPairMatchingOnBothEntryPoints(t *testing.T) {
+	chat := openai.ChatRequest{
+		Model: "muse-spark-1.3-contributor",
+		Messages: []openai.ChatMessage{
+			{Role: "user", Content: "hi"},
+			{Role: "assistant", ToolCalls: []openai.ToolCall{
+				{ID: "lonely", Type: "function", Function: openai.FunctionCall{Name: "bash", Arguments: `{}`}},
+				{ID: "ok", Type: "function", Function: openai.FunctionCall{Name: "bash", Arguments: `{}`}},
+			}},
+			{Role: "tool", Content: "done", ToolCallID: "ok"},
+		},
+	}
+	body := ChatToResponses(chat, "muse-spark-1.3-contributor")
+	raw, _ := json.Marshal(body["input"])
+	var citems []map[string]any
+	if err := json.Unmarshal(raw, &citems); err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range citems {
+		if it["type"] == "function_call" && it["call_id"] == "lonely" {
+			t.Fatalf("chat path kept unmatched call: %s", raw)
+		}
+	}
+
+	var rreq openai.ResponsesRequest
+	rawReq := `{"model": "muse-spark-1.3-contributor", "input": [
+		{"type": "function_call", "call_id": "lonely", "name": "bash", "arguments": "{}"},
+		{"type": "function_call", "call_id": "ok", "name": "bash", "arguments": "{}"},
+		{"type": "function_call_output", "call_id": "ok", "output": "done"}
+	]}`
+	if err := json.Unmarshal([]byte(rawReq), &rreq); err != nil {
+		t.Fatal(err)
+	}
+	rbody := ResponsesUpstreamBody(rreq, "muse-spark-1.3-contributor", effort.Unspecified)
+	rraw, _ := json.Marshal(rbody["input"])
+	var ritems []map[string]any
+	if err := json.Unmarshal(rraw, &ritems); err != nil {
+		t.Fatal(err)
+	}
+	if len(ritems) != 2 {
+		t.Fatalf("responses path items = %d, want 2: %s", len(ritems), rraw)
+	}
+}
+
+// The generic-400 matcher must fire only on upstream's exact detail-free
+// shape: type invalid_request_error, null/missing param, and the known
+// message prefix.
+func TestIsGenericInvalidParams(t *testing.T) {
+	generic := `{"model":"muse-spark-1.3-contributor","error":{"code":null,"message":"The request contains invalid parameters. Check the request body for any errors or inconsistencies.","param":null,"type":"invalid_request_error"}}`
+	if !IsGenericInvalidParams([]byte(generic)) {
+		t.Errorf("generic upstream 400 not matched")
+	}
+	specific := `{"error":{"message":"No function call found for function call output with call_id 'x'","param":"call_id","type":"invalid_request_error"}}`
+	if IsGenericInvalidParams([]byte(specific)) {
+		t.Errorf("specific param error matched as generic")
+	}
+	other := `{"error":{"message":"quota exceeded","type":"insufficient_quota","code":"quota"}}`
+	if IsGenericInvalidParams([]byte(other)) {
+		t.Errorf("quota error matched as generic")
+	}
+	if IsGenericInvalidParams([]byte(`not json`)) {
+		t.Errorf("garbage matched as generic")
+	}
+}
+
+// bytes/4 estimator sanity: the real 3.6MB failing body must estimate above
+// the 1M muse-spark window, small bodies far below.
+func TestEstimateTokensScalesWithBody(t *testing.T) {
+	if got := EstimateTokens(nil); got != 0 {
+		t.Errorf("nil = %d, want 0", got)
+	}
+	small := map[string]any{"model": "m", "input": "hi"}
+	if got := EstimateTokens(small); got > 100 {
+		t.Errorf("small = %d, want tiny", got)
+	}
+	// 4.8MB body: must estimate above the 1M muse-spark window
+	// (the real failing body was 3.6MB at ~0.33 tok/char).
+	big := map[string]any{"model": "m", "input": strings.Repeat("0123456789abcdef", 300000)}
+	if got := EstimateTokens(big); got < 1000000 {
+		t.Errorf("4.8MB body = %d, want >= 1000000", got)
+	}
 }

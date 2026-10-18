@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/eddiectc/opencodegw/internal/config"
+	"github.com/eddiectc/opencodegw/internal/models"
 	"github.com/eddiectc/opencodegw/internal/openai"
+	"github.com/eddiectc/opencodegw/internal/translate"
 	"github.com/eddiectc/opencodegw/internal/upstream"
 )
 
@@ -95,6 +97,17 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, openai.ErrorResponse{
 		Error: openai.ErrorBody{Message: msg, Type: code, Code: code},
 	})
+}
+
+// classifyUpstreamBody snapshots the failure context for an upstream request
+// body: estimated input tokens plus the model's known window. displayModel
+// is echoed in rewritten errors; normalized is used for window lookup.
+func classifyUpstreamBody(upstreamBody any, displayModel, normalized string) upstreamFailure {
+	return upstreamFailure{
+		estTokens: translate.EstimateTokens(upstreamBody),
+		window:    models.ContextWindow(normalized),
+		model:     displayModel,
+	}
 }
 
 // sessionHeaders builds the extra headers forwarded upstream:

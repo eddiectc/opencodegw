@@ -19,7 +19,9 @@ func ChatToResponses(req openai.ChatRequest, model string) map[string]any {
 		"model": model,
 	}
 	input, instructions := chatMessagesToResponsesInput(req.Messages)
-	if input != nil {
+	if items, ok := input.([]any); ok {
+		out["input"] = matchToolPairs(items)
+	} else if input != nil {
 		out["input"] = input
 	}
 	if instructions != "" {
