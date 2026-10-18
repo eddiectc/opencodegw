@@ -84,6 +84,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	applyDefaultEffortChat(&req, s.cfg.DefaultEffort)
+	defEff := effort.Normalize(s.cfg.DefaultEffort)
 	stream := req.Stream != nil && *req.Stream
 
 	backend := models.Lookup(req.Model)
@@ -102,9 +103,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		upstreamBody = translate.ChatToGemini(req, model)
 		path = models.UpstreamPath(backend, model, stream)
 	default:
-		// Chat backend: forward nearly as-is, but normalize effort to
-		// reasoning_effort and drop gateway-only aliases.
-		upstreamBody = chatPassthroughBody(req, model)
+		// Chat-native backend: raw passthrough with surgical fixes so
+		// native/unknown fields survive verbatim.
+		upstreamBody = translate.ChatNativeBody(body, req, model, defEff)
 		path = models.UpstreamPath(backend, model, false)
 	}
 
@@ -177,8 +178,12 @@ func applyDefaultEffortChat(req *openai.ChatRequest, def string) {
 	}
 }
 
-func applyDefaultEffortResponses(req *openai.ResponsesRequest, def string) {
+func applyDefaultEffortResponses(req *openai.ResponsesRequest, raw []byte, def string) {
 	if translate.EffortFromResponses(*req).Valid() {
+		return
+	}
+	// Honor raw-only alias spellings the struct does not decode.
+	if translate.EffortFromResponsesRaw(raw).Valid() {
 		return
 	}
 	if l := effort.Normalize(def); l.Valid() {

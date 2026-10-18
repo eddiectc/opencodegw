@@ -422,7 +422,9 @@ func sanitizeResponsesItem(it map[string]any) (any, bool) {
 }
 
 // sanitizeInputContent keeps valid user/system/developer parts and drops
-// empty ones. A bare string becomes one input_text part.
+// empty ones. A bare string becomes one input_text part. Audio, file, image
+// and any future input_* part types pass through verbatim so native calls
+// stay lossless.
 func sanitizeInputContent(c any) []any {
 	if s, ok := c.(string); ok {
 		if s == "" {
@@ -433,19 +435,23 @@ func sanitizeInputContent(c any) []any {
 	parts := contentParts(c)
 	out := make([]any, 0, len(parts))
 	for _, p := range parts {
-		switch p["type"] {
+		typ, _ := p["type"].(string)
+		switch typ {
 		case "input_text":
 			if t, ok := p["text"].(string); ok && t != "" {
 				out = append(out, map[string]any{"type": "input_text", "text": t})
 			}
-		case "input_image":
-			out = append(out, p)
-		case "input_file":
-			out = append(out, p)
 		case "text":
 			// Chat-style part: normalize to input_text.
 			if t, ok := p["text"].(string); ok && t != "" {
 				out = append(out, map[string]any{"type": "input_text", "text": t})
+			}
+		case "input_image", "input_file", "input_audio":
+			out = append(out, p)
+		default:
+			// Future input_* part types pass through verbatim.
+			if strings.HasPrefix(typ, "input_") {
+				out = append(out, p)
 			}
 		}
 	}

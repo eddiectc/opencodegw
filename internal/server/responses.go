@@ -32,7 +32,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "model is required")
 		return
 	}
-	applyDefaultEffortResponses(&req, s.cfg.DefaultEffort)
+	applyDefaultEffortResponses(&req, body, s.cfg.DefaultEffort)
 	defEff := effort.Normalize(s.cfg.DefaultEffort)
 	stream := req.Stream != nil && *req.Stream
 
@@ -41,13 +41,13 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	extra := sessionHeaders(r)
 
 	if stream {
-		s.serveResponsesStream(w, r, backend, model, req, defEff, extra)
+		s.serveResponsesStream(w, r, backend, model, req, body, defEff, extra)
 		return
 	}
 
 	// Non-streaming: responses-native goes direct; others go via chat translators.
 	if backend == models.BackendResponses {
-		upBody := translate.ResponsesUpstreamBody(req, model, defEff)
+		upBody := translate.ResponsesNativeBody(body, req, model, defEff)
 		path := models.UpstreamPath(backend, model, false)
 		fail := classifyUpstreamBody(upBody, req.Model, model)
 		status, raw, hdr, err := s.upstream.DoJSON(r.Context(), "POST", path, upBody, extra, false)
@@ -157,7 +157,7 @@ func (s *Server) doChatBackend(r *http.Request, backend models.Backend, model st
 // Upstream setup failures are proxied as JSON errors before SSE headers are
 // sent. Mid-stream failures ride the stream as response.failed + error events
 // because headers are already committed. No retries anywhere.
-func (s *Server) serveResponsesStream(w http.ResponseWriter, r *http.Request, backend models.Backend, model string, req openai.ResponsesRequest, defEff effort.Level, extra http.Header) {
+func (s *Server) serveResponsesStream(w http.ResponseWriter, r *http.Request, backend models.Backend, model string, req openai.ResponsesRequest, rawBody []byte, defEff effort.Level, extra http.Header) {
 	sendSSEHeaders := func() http.Flusher {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -173,7 +173,7 @@ func (s *Server) serveResponsesStream(w http.ResponseWriter, r *http.Request, ba
 	var upstreamBody any
 	var path string
 	if backend == models.BackendResponses {
-		upBody := translate.ResponsesUpstreamBody(req, model, defEff)
+		upBody := translate.ResponsesNativeBody(rawBody, req, model, defEff)
 		upBody["stream"] = true
 		upstreamBody = upBody
 		path = models.UpstreamPath(backend, model, false)
