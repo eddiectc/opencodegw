@@ -185,8 +185,10 @@ func ResponsesUpstreamBody(req openai.ResponsesRequest, model string, defaultEff
 		m["reasoning"] = map[string]any{"effort": e}
 	} else {
 		delete(m, "reasoning")
-		delete(m, "reasoning_effort")
 	}
+	// reasoning_effort is gateway-only: upstream Responses accepts the effort
+	// only inside the reasoning object and rejects the alias as unknown.
+	delete(m, "reasoning_effort")
 	if s, ok := m["stream"].(bool); !ok || !s {
 		delete(m, "stream")
 	}

@@ -399,7 +399,29 @@ func TestIsGenericInvalidParams(t *testing.T) {
 	}
 }
 
-// bytes/4 estimator sanity: the real 3.6MB failing body must estimate above
+// The gateway-only reasoning_effort alias must never reach upstream
+// Responses bodies: upstream rejects it as an unknown parameter. This bit
+// when -default-effort injects the alias and the request resolves valid.
+func TestResponsesUpstreamBodyDropsEffortAlias(t *testing.T) {
+	var req openai.ResponsesRequest
+	if err := json.Unmarshal([]byte(`{
+		"model": "muse-spark-1.3-contributor",
+		"reasoning_effort": "max",
+		"input": "hi"
+	}`), &req); err != nil {
+		t.Fatal(err)
+	}
+	body := ResponsesUpstreamBody(req, "muse-spark-1.3-contributor", effort.Unspecified)
+	if _, ok := body["reasoning_effort"]; ok {
+		t.Fatalf("reasoning_effort leaked upstream: %v", body)
+	}
+	r, ok := body["reasoning"].(map[string]any)
+	if !ok || r["effort"] != "max" {
+		t.Fatalf("reasoning block = %v, want effort/max", body["reasoning"])
+	}
+}
+
+// bytes/3 estimator sanity: the real 3.62MB failing body must estimate above
 // the 1M muse-spark window, small bodies far below.
 func TestEstimateTokensScalesWithBody(t *testing.T) {
 	if got := EstimateTokens(nil); got != 0 {
