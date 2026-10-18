@@ -409,10 +409,10 @@ func TestEstimateTokensScalesWithBody(t *testing.T) {
 	if got := EstimateTokens(small); got > 100 {
 		t.Errorf("small = %d, want tiny", got)
 	}
-	// 4.8MB body: must estimate above the 1M muse-spark window
-	// (the real failing body was 3.6MB at ~0.33 tok/char).
-	big := map[string]any{"model": "m", "input": strings.Repeat("0123456789abcdef", 300000)}
+	// The real failing body was 3.62MB of dense tool output: it must
+	// estimate at/above the 1M muse-spark window.
+	big := map[string]any{"model": "m", "input": strings.Repeat("0123456789abcdef", 226250)}
 	if got := EstimateTokens(big); got < 1000000 {
-		t.Errorf("4.8MB body = %d, want >= 1000000", got)
+		t.Errorf("3.62MB body = %d, want >= 1000000", got)
 	}
 }
